@@ -15,6 +15,98 @@ mysql = MySQL(app)
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+# --- Response formatting helper ---
+
+def _to_xml_tag(key):
+    # Ensure valid XML tag by removing spaces and non-alnum (basic safety)
+    safe = re.sub(r"[^a-zA-Z0-9_]", "", str(key)) or "item"
+    # Tags cannot start with a digit
+    if safe[0].isdigit():
+        safe = f"_{safe}"
+    return safe
+
+
+def _escape_xml(text):
+    if text is None:
+        return ""
+    s = str(text)
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+         .replace("'", "&apos;")
+    )
+
+
+def _dict_to_xml(d, root_name="object"):
+    parts = [f"<{root_name}>"]
+    for k, v in d.items():
+        tag = _to_xml_tag(k)
+        if isinstance(v, dict):
+            parts.append(_dict_to_xml(v, root_name=tag))
+        elif isinstance(v, list):
+            parts.append(f"<{tag}>")
+            for item in v:
+                if isinstance(item, dict):
+                    parts.append(_dict_to_xml(item, root_name="item"))
+                else:
+                    parts.append(f"<item>{_escape_xml(item)}</item>")
+            parts.append(f"</{tag}>")
+        else:
+            parts.append(f"<{tag}>{_escape_xml(v)}</{tag}>")
+    parts.append(f"</{root_name}>")
+    return "".join(parts)
+
+
+def _list_to_xml(lst, root_name="items", item_name="item"):
+    parts = [f"<{root_name}>"]
+    for item in lst:
+        if isinstance(item, dict):
+            parts.append(_dict_to_xml(item, root_name=item_name))
+        else:
+            parts.append(f"<{item_name}>{_escape_xml(item)}</{item_name}>")
+    parts.append(f"</{root_name}>")
+    return "".join(parts)
+
+
+def render_response(payload, status=200, headers=None):
+    """Render payload as JSON (default) or XML based on `format` query arg.
+    - Accepts dict or list payload. For non-JSON payload (string/None), returns as-is.
+    - Sets appropriate Content-Type header.
+    """
+    fmt = (request.args.get("format") or "json").lower()
+    headers = headers or {}
+
+    # Default JSON behavior for tests
+    if fmt not in ("xml", "json"):
+        fmt = "json"
+
+    if fmt == "xml":
+        # Convert payload to XML
+        if isinstance(payload, list):
+            body = _list_to_xml(payload, root_name="items", item_name="item")
+        elif isinstance(payload, dict):
+            body = _dict_to_xml(payload, root_name="response")
+        else:
+            # passthrough for empty string or text
+            body = _escape_xml(payload) if payload is not None else ""
+        resp = make_response(body, status)
+        resp.headers['Content-Type'] = 'application/xml; charset=utf-8'
+        for k, v in headers.items():
+            resp.headers[k] = v
+        return resp
+
+    # JSON
+    resp = make_response(jsonify(payload) if payload not in (None, "") else (payload or ""), status)
+    # Only set JSON content type when we used jsonify
+    if isinstance(payload, (dict, list)):
+        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
+    for k, v in headers.items():
+        resp.headers[k] = v
+    return resp
+
+
 def validate_user_payload(data, require_all=False):
     if not isinstance(data, dict):
         return False, "Invalid JSON payload"
@@ -56,10 +148,10 @@ def testdb():
         cur.execute("SELECT DATABASE()")
         data = cur.fetchone()
         cur.close()
-        return jsonify({'database': data[0] if data else None}), 200
+        return render_response({'database': data[0] if data else None}, 200)
     except Exception as e:
         app.logger.exception('Database connectivity test failed')
-        return make_response(jsonify({'error': 'Database error', 'detail': str(e)}), 500)
+        return render_response({'error': 'Database error', 'detail': str(e)}, 500)
 
 # CRUD: Users
 @app.route('/users', methods=['GET'])
@@ -70,12 +162,10 @@ def list_users():
         rows = cur.fetchall()
         cur.close()
         users = [{'id': r[0], 'name': r[1], 'email': r[2], 'age': r[3]} for r in rows]
-        resp = make_response(jsonify(users), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+        return render_response(users, 200)
     except Exception as e:
         app.logger.exception('List users failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/users/<int:user_id>', methods=['GET'])
@@ -86,14 +176,12 @@ def get_user(user_id):
         row = cur.fetchone()
         cur.close()
         if not row:
-            return make_response(jsonify({'error': 'User not found'}), 404)
+            return render_response({'error': 'User not found'}, 404)
         user = {'id': row[0], 'name': row[1], 'email': row[2], 'age': row[3]}
-        resp = make_response(jsonify(user), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+        return render_response(user, 200)
     except Exception as e:
         app.logger.exception('Get user failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/users', methods=['POST'])
@@ -101,7 +189,7 @@ def create_user():
     data = request.get_json(silent=True)
     ok, err = validate_user_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
 
     name = data['name'].strip()
     email = data['email'].strip()
@@ -114,13 +202,11 @@ def create_user():
         new_id = cur.lastrowid
         cur.close()
         location = url_for('get_user', user_id=new_id, _external=True)
-        resp = make_response(jsonify({'id': new_id, 'name': name, 'email': email, 'age': age}), 201)
-        resp.headers['Location'] = location
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+        headers = {'Location': location}
+        return render_response({'id': new_id, 'name': name, 'email': email, 'age': age}, 201, headers=headers)
     except Exception as e:
         app.logger.exception('Create user failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/users/<int:user_id>', methods=['PUT'])
@@ -128,7 +214,7 @@ def update_user(user_id):
     data = request.get_json(silent=True)
     ok, err = validate_user_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
 
     name = data['name'].strip()
     email = data['email'].strip()
@@ -141,24 +227,22 @@ def update_user(user_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'User not found'}), 404)
-        resp = make_response(jsonify({'id': user_id, 'name': name, 'email': email, 'age': age}), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+            return render_response({'error': 'User not found'}, 404)
+        return render_response({'id': user_id, 'name': name, 'email': email, 'age': age}, 200)
     except Exception as e:
         app.logger.exception('Update user failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/users/<int:user_id>', methods=['PATCH'])
 def patch_user(user_id):
     data = request.get_json(silent=True)
     if not data:
-        return make_response(jsonify({'error': 'Empty payload'}), 400)
+        return render_response({'error': 'Empty payload'}, 400)
 
     ok, err = validate_user_payload(data, require_all=False)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
 
     fields = []
     values = []
@@ -171,7 +255,7 @@ def patch_user(user_id):
             fields.append(f"{key} = %s")
 
     if not fields:
-        return make_response(jsonify({'error': 'No updatable fields provided'}), 400)
+        return render_response({'error': 'No updatable fields provided'}, 400)
 
     sql = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
     values.append(user_id)
@@ -183,18 +267,16 @@ def patch_user(user_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'User not found'}), 404)
+            return render_response({'error': 'User not found'}, 404)
         cur = mysql.connection.cursor()
         cur.execute("SELECT id, name, email, age FROM users WHERE id = %s", (user_id,))
         row = cur.fetchone()
         cur.close()
         user = {'id': row[0], 'name': row[1], 'email': row[2], 'age': row[3]} if row else {'id': user_id}
-        resp = make_response(jsonify(user), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+        return render_response(user, 200)
     except Exception as e:
         app.logger.exception('Patch user failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/users/<int:user_id>', methods=['DELETE'])
@@ -206,12 +288,12 @@ def delete_user(user_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'User not found'}), 404)
-        resp = make_response('', 204)
-        return resp
+            return render_response({'error': 'User not found'}, 404)
+        # No content
+        return render_response('', 204)
     except Exception as e:
         app.logger.exception('Delete user failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 # CRUD: Customers
@@ -223,12 +305,10 @@ def list_customers():
         rows = cur.fetchall()
         cur.close()
         customers = [{'CustomerID': r[0], 'Name': r[1], 'Phone': r[2]} for r in rows]
-        resp = make_response(jsonify(customers), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+        return render_response(customers, 200)
     except Exception as e:
         app.logger.exception('List customers failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 def validate_customer_payload(data, require_all=False):
@@ -257,7 +337,7 @@ def create_customer():
     data = request.get_json(silent=True)
     ok, err = validate_customer_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response(jsonify({'error': err}).json, 400)
     name = data['Name'].strip()
     phone = (data.get('Phone') or '').strip() or None
     try:
@@ -267,13 +347,11 @@ def create_customer():
         new_id = cur.lastrowid
         cur.close()
         location = url_for('get_customer', customer_id=new_id, _external=True)
-        resp = make_response(jsonify({'CustomerID': new_id, 'Name': name, 'Phone': phone}), 201)
-        resp.headers['Location'] = location
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+        headers = {'Location': location}
+        return render_response({'CustomerID': new_id, 'Name': name, 'Phone': phone}, 201, headers=headers)
     except Exception as e:
         app.logger.exception('Create customer failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/customers/<int:customer_id>', methods=['GET'])
@@ -284,13 +362,11 @@ def get_customer(customer_id):
         row = cur.fetchone()
         cur.close()
         if not row:
-            return make_response(jsonify({'error': 'Customer not found'}), 404)
-        resp = make_response(jsonify({'CustomerID': row[0], 'Name': row[1], 'Phone': row[2]}), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+            return render_response({'error': 'Customer not found'}, 404)
+        return render_response({'CustomerID': row[0], 'Name': row[1], 'Phone': row[2]}, 200)
     except Exception as e:
         app.logger.exception('Get customer failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/customers/<int:customer_id>', methods=['PUT'])
@@ -298,7 +374,7 @@ def update_customer(customer_id):
     data = request.get_json(silent=True)
     ok, err = validate_customer_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     name = data['Name'].strip()
     phone = (data.get('Phone') or '').strip() or None
     try:
@@ -308,23 +384,21 @@ def update_customer(customer_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Customer not found'}), 404)
-        resp = make_response(jsonify({'CustomerID': customer_id, 'Name': name, 'Phone': phone}), 200)
-        resp.headers['Content-Type'] = 'application/json; charset=utf-8'
-        return resp
+            return render_response({'error': 'Customer not found'}, 404)
+        return render_response({'CustomerID': customer_id, 'Name': name, 'Phone': phone}, 200)
     except Exception as e:
         app.logger.exception('Update customer failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/customers/<int:customer_id>', methods=['PATCH'])
 def patch_customer(customer_id):
     data = request.get_json(silent=True)
     if not data:
-        return make_response(jsonify({'error': 'Empty payload'}), 400)
+        return render_response({'error': 'Empty payload'}, 400)
     ok, err = validate_customer_payload(data, require_all=False)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     fields = []
     values = []
     for key, col in [('Name', 'Name'), ('Phone', 'Phone')]:
@@ -335,7 +409,7 @@ def patch_customer(customer_id):
             values.append(val or None)
             fields.append(f"{col}=%s")
     if not fields:
-        return make_response(jsonify({'error': 'No updatable fields provided'}), 400)
+        return render_response({'error': 'No updatable fields provided'}, 400)
     sql = f"UPDATE customers SET {', '.join(fields)} WHERE CustomerID=%s"
     values.append(customer_id)
     try:
@@ -345,11 +419,11 @@ def patch_customer(customer_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Customer not found'}), 404)
-        return make_response(jsonify({'CustomerID': customer_id}), 200)
+            return render_response({'error': 'Customer not found'}, 404)
+        return render_response({'CustomerID': customer_id}, 200)
     except Exception as e:
         app.logger.exception('Patch customer failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/customers/<int:customer_id>', methods=['DELETE'])
@@ -361,11 +435,11 @@ def delete_customer(customer_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Customer not found'}), 404)
-        return make_response('', 204)
+            return render_response({'error': 'Customer not found'}, 404)
+        return render_response('', 204)
     except Exception as e:
         app.logger.exception('Delete customer failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 # CRUD: Products
@@ -377,10 +451,10 @@ def list_products():
         rows = cur.fetchall()
         cur.close()
         products = [{'ProductID': r[0], 'ProductName': r[1], 'Price': float(r[2]) if r[2] is not None else None} for r in rows]
-        return make_response(jsonify(products), 200)
+        return render_response(products, 200)
     except Exception as e:
         app.logger.exception('List products failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 def validate_product_payload(data, require_all=False):
@@ -410,7 +484,7 @@ def create_product():
     data = request.get_json(silent=True)
     ok, err = validate_product_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     name = data['ProductName'].strip()
     price = float(data['Price'])
     try:
@@ -420,12 +494,11 @@ def create_product():
         new_id = cur.lastrowid
         cur.close()
         location = url_for('get_product', product_id=new_id, _external=True)
-        resp = make_response(jsonify({'ProductID': new_id, 'ProductName': name, 'Price': price}), 201)
-        resp.headers['Location'] = location
-        return resp
+        headers = {'Location': location}
+        return render_response({'ProductID': new_id, 'ProductName': name, 'Price': price}, 201, headers=headers)
     except Exception as e:
         app.logger.exception('Create product failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/products/<int:product_id>', methods=['GET'])
@@ -436,11 +509,11 @@ def get_product(product_id):
         row = cur.fetchone()
         cur.close()
         if not row:
-            return make_response(jsonify({'error': 'Product not found'}), 404)
-        return make_response(jsonify({'ProductID': row[0], 'ProductName': row[1], 'Price': float(row[2]) if row[2] is not None else None}), 200)
+            return render_response({'error': 'Product not found'}, 404)
+        return render_response({'ProductID': row[0], 'ProductName': row[1], 'Price': float(row[2]) if row[2] is not None else None}, 200)
     except Exception as e:
         app.logger.exception('Get product failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/products/<int:product_id>', methods=['PUT'])
@@ -448,7 +521,7 @@ def update_product(product_id):
     data = request.get_json(silent=True)
     ok, err = validate_product_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     name = data['ProductName'].strip()
     price = float(data['Price'])
     try:
@@ -458,37 +531,37 @@ def update_product(product_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Product not found'}), 404)
-        return make_response(jsonify({'ProductID': product_id, 'ProductName': name, 'Price': price}), 200)
+            return render_response({'error': 'Product not found'}, 404)
+        return render_response({'ProductID': product_id, 'ProductName': name, 'Price': price}, 200)
     except Exception as e:
         app.logger.exception('Update product failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/products/<int:product_id>', methods=['PATCH'])
 def patch_product(product_id):
     data = request.get_json(silent=True)
     if not data:
-        return make_response(jsonify({'error': 'Empty payload'}), 400)
+        return render_response({'error': 'Empty payload'}, 400)
     ok, err = validate_product_payload(data, require_all=False)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     fields = []
     values = []
     if 'ProductName' in data:
         name = data['ProductName']
         if not isinstance(name, str) or not name.strip():
-            return make_response(jsonify({'error': '`ProductName` must be a non-empty string'}), 400)
+            return render_response({'error': '`ProductName` must be a non-empty string'}, 400)
         fields.append('ProductName=%s')
         values.append(name.strip())
     if 'Price' in data:
         price = data['Price']
         if not isinstance(price, (int, float)) or float(price) < 0:
-            return make_response(jsonify({'error': '`Price` must be a non-negative number'}), 400)
+            return render_response({'error': '`Price` must be a non-negative number'}, 400)
         fields.append('Price=%s')
         values.append(float(price))
     if not fields:
-        return make_response(jsonify({'error': 'No updatable fields provided'}), 400)
+        return render_response({'error': 'No updatable fields provided'}, 400)
     sql = f"UPDATE products SET {', '.join(fields)} WHERE ProductID=%s"
     values.append(product_id)
     try:
@@ -498,11 +571,11 @@ def patch_product(product_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Product not found'}), 404)
-        return make_response(jsonify({'ProductID': product_id}), 200)
+            return render_response({'error': 'Product not found'}, 404)
+        return render_response({'ProductID': product_id}, 200)
     except Exception as e:
         app.logger.exception('Patch product failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/products/<int:product_id>', methods=['DELETE'])
@@ -514,11 +587,11 @@ def delete_product(product_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Product not found'}), 404)
-        return make_response('', 204)
+            return render_response({'error': 'Product not found'}, 404)
+        return render_response('', 204)
     except Exception as e:
         app.logger.exception('Delete product failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 # CRUD: Orders
@@ -530,10 +603,10 @@ def list_orders():
         rows = cur.fetchall()
         cur.close()
         orders = [{'OrderID': r[0], 'CustomerID': r[1], 'ProductID': r[2], 'Quantity': r[3]} for r in rows]
-        return make_response(jsonify(orders), 200)
+        return render_response(orders, 200)
     except Exception as e:
         app.logger.exception('List orders failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 def validate_order_payload(data, require_all=False):
@@ -571,15 +644,15 @@ def create_order():
     data = request.get_json(silent=True)
     ok, err = validate_order_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     customer_id = data['CustomerID']
     product_id = data['ProductID']
     quantity = data['Quantity']
     # Foreign key checks
     if not entity_exists('customers', 'CustomerID', customer_id):
-        return make_response(jsonify({'error': 'Customer does not exist'}), 404)
+        return render_response({'error': 'Customer does not exist'}, 404)
     if not entity_exists('products', 'ProductID', product_id):
-        return make_response(jsonify({'error': 'Product does not exist'}), 404)
+        return render_response({'error': 'Product does not exist'}, 404)
     try:
         cur = mysql.connection.cursor()
         cur.execute("INSERT INTO orders (CustomerID, ProductID, Quantity) VALUES (%s, %s, %s)", (customer_id, product_id, quantity))
@@ -587,12 +660,11 @@ def create_order():
         new_id = cur.lastrowid
         cur.close()
         location = url_for('get_order', order_id=new_id, _external=True)
-        resp = make_response(jsonify({'OrderID': new_id, 'CustomerID': customer_id, 'ProductID': product_id, 'Quantity': quantity}), 201)
-        resp.headers['Location'] = location
-        return resp
+        headers = {'Location': location}
+        return render_response({'OrderID': new_id, 'CustomerID': customer_id, 'ProductID': product_id, 'Quantity': quantity}, 201, headers=headers)
     except Exception as e:
         app.logger.exception('Create order failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/orders/<int:order_id>', methods=['GET'])
@@ -603,11 +675,11 @@ def get_order(order_id):
         row = cur.fetchone()
         cur.close()
         if not row:
-            return make_response(jsonify({'error': 'Order not found'}), 404)
-        return make_response(jsonify({'OrderID': row[0], 'CustomerID': row[1], 'ProductID': row[2], 'Quantity': row[3]}), 200)
+            return render_response({'error': 'Order not found'}, 404)
+        return render_response({'OrderID': row[0], 'CustomerID': row[1], 'ProductID': row[2], 'Quantity': row[3]}, 200)
     except Exception as e:
         app.logger.exception('Get order failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/orders/<int:order_id>', methods=['PUT'])
@@ -615,14 +687,14 @@ def update_order(order_id):
     data = request.get_json(silent=True)
     ok, err = validate_order_payload(data or {}, require_all=True)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     customer_id = data['CustomerID']
     product_id = data['ProductID']
     quantity = data['Quantity']
     if not entity_exists('customers', 'CustomerID', customer_id):
-        return make_response(jsonify({'error': 'Customer does not exist'}), 404)
+        return render_response({'error': 'Customer does not exist'}, 404)
     if not entity_exists('products', 'ProductID', product_id):
-        return make_response(jsonify({'error': 'Product does not exist'}), 404)
+        return render_response({'error': 'Product does not exist'}, 404)
     try:
         cur = mysql.connection.cursor()
         cur.execute("UPDATE orders SET CustomerID=%s, ProductID=%s, Quantity=%s WHERE OrderID=%s", (customer_id, product_id, quantity, order_id))
@@ -630,47 +702,47 @@ def update_order(order_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Order not found'}), 404)
-        return make_response(jsonify({'OrderID': order_id, 'CustomerID': customer_id, 'ProductID': product_id, 'Quantity': quantity}), 200)
+            return render_response({'error': 'Order not found'}, 404)
+        return render_response({'OrderID': order_id, 'CustomerID': customer_id, 'ProductID': product_id, 'Quantity': quantity}, 200)
     except Exception as e:
         app.logger.exception('Update order failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/orders/<int:order_id>', methods=['PATCH'])
 def patch_order(order_id):
     data = request.get_json(silent=True)
     if not data:
-        return make_response(jsonify({'error': 'Empty payload'}), 400)
+        return render_response({'error': 'Empty payload'}, 400)
     ok, err = validate_order_payload(data, require_all=False)
     if not ok:
-        return make_response(jsonify({'error': err}), 400)
+        return render_response({'error': err}, 400)
     fields = []
     values = []
     if 'CustomerID' in data:
         cid = data['CustomerID']
         if not isinstance(cid, int):
-            return make_response(jsonify({'error': '`CustomerID` must be an integer'}), 400)
+            return render_response({'error': '`CustomerID` must be an integer'}, 400)
         if not entity_exists('customers', 'CustomerID', cid):
-            return make_response(jsonify({'error': 'Customer does not exist'}), 404)
+            return render_response({'error': 'Customer does not exist'}, 404)
         fields.append('CustomerID=%s')
         values.append(cid)
     if 'ProductID' in data:
         pid = data['ProductID']
         if not isinstance(pid, int):
-            return make_response(jsonify({'error': '`ProductID` must be an integer'}), 400)
+            return render_response({'error': '`ProductID` must be an integer'}, 400)
         if not entity_exists('products', 'ProductID', pid):
-            return make_response(jsonify({'error': 'Product does not exist'}), 404)
+            return render_response({'error': 'Product does not exist'}, 404)
         fields.append('ProductID=%s')
         values.append(pid)
     if 'Quantity' in data:
         qty = data['Quantity']
         if not isinstance(qty, int) or qty <= 0:
-            return make_response(jsonify({'error': '`Quantity` must be a positive integer'}), 400)
+            return render_response({'error': '`Quantity` must be a positive integer'}, 400)
         fields.append('Quantity=%s')
         values.append(qty)
     if not fields:
-        return make_response(jsonify({'error': 'No updatable fields provided'}), 400)
+        return render_response({'error': 'No updatable fields provided'}, 400)
     sql = f"UPDATE orders SET {', '.join(fields)} WHERE OrderID=%s"
     values.append(order_id)
     try:
@@ -680,11 +752,11 @@ def patch_order(order_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Order not found'}), 404)
-        return make_response(jsonify({'OrderID': order_id}), 200)
+            return render_response({'error': 'Order not found'}, 404)
+        return render_response({'OrderID': order_id}, 200)
     except Exception as e:
         app.logger.exception('Patch order failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
@@ -696,11 +768,11 @@ def delete_order(order_id):
         affected = cur.rowcount
         cur.close()
         if affected == 0:
-            return make_response(jsonify({'error': 'Order not found'}), 404)
-        return make_response('', 204)
+            return render_response({'error': 'Order not found'}, 404)
+        return render_response('', 204)
     except Exception as e:
         app.logger.exception('Delete order failed')
-        return make_response(jsonify({'error': 'Database error'}), 500)
+        return render_response({'error': 'Database error'}, 500)
 
 
 if __name__ == '__main__':
