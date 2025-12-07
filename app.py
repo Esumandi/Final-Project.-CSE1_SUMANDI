@@ -157,8 +157,43 @@ def testdb():
 @app.route('/users', methods=['GET'])
 def list_users():
     try:
+        # Build filters from query params
+        where = []
+        params = []
+        name = request.args.get('name')
+        email = request.args.get('email')
+        age = request.args.get('age')
+        min_age = request.args.get('min_age')
+        max_age = request.args.get('max_age')
+        if name:
+            where.append("name LIKE %s")
+            params.append(f"%{name.strip()}%")
+        if email:
+            where.append("email LIKE %s")
+            params.append(f"%{email.strip()}%")
+        if age is not None and age != "":
+            try:
+                age_val = int(age)
+                where.append("age = %s")
+                params.append(age_val)
+            except ValueError:
+                return render_response({'error': '`age` must be integer'}, 400)
+        if min_age is not None and min_age != "":
+            try:
+                where.append("age >= %s")
+                params.append(int(min_age))
+            except ValueError:
+                return render_response({'error': '`min_age` must be integer'}, 400)
+        if max_age is not None and max_age != "":
+            try:
+                where.append("age <= %s")
+                params.append(int(max_age))
+            except ValueError:
+                return render_response({'error': '`max_age` must be integer'}, 400)
+        base = "SELECT id, name, email, age FROM users"
+        sql = base + (" WHERE " + " AND ".join(where) if where else "")
         cur = mysql.connection.cursor()
-        cur.execute("SELECT id, name, email, age FROM users")
+        cur.execute(sql, tuple(params))
         rows = cur.fetchall()
         cur.close()
         users = [{'id': r[0], 'name': r[1], 'email': r[2], 'age': r[3]} for r in rows]
@@ -300,8 +335,28 @@ def delete_user(user_id):
 @app.route('/customers', methods=['GET'])
 def list_customers():
     try:
+        # Filters: Name (LIKE), Phone (LIKE), CustomerID exact
+        where = []
+        params = []
+        cid = request.args.get('CustomerID')
+        name = request.args.get('Name')
+        phone = request.args.get('Phone')
+        if cid is not None and cid != "":
+            try:
+                where.append("CustomerID = %s")
+                params.append(int(cid))
+            except ValueError:
+                return render_response({'error': '`CustomerID` must be integer'}, 400)
+        if name:
+            where.append("Name LIKE %s")
+            params.append(f"%{name.strip()}%")
+        if phone:
+            where.append("Phone LIKE %s")
+            params.append(f"%{phone.strip()}%")
+        base = "SELECT CustomerID, Name, Phone FROM customers"
+        sql = base + (" WHERE " + " AND ".join(where) if where else "")
         cur = mysql.connection.cursor()
-        cur.execute("SELECT CustomerID, Name, Phone FROM customers")
+        cur.execute(sql, tuple(params))
         rows = cur.fetchall()
         cur.close()
         customers = [{'CustomerID': r[0], 'Name': r[1], 'Phone': r[2]} for r in rows]
@@ -446,8 +501,46 @@ def delete_customer(customer_id):
 @app.route('/products', methods=['GET'])
 def list_products():
     try:
+        # Filters: ProductID exact, ProductName LIKE, Price exact/range
+        where = []
+        params = []
+        pid = request.args.get('ProductID')
+        name = request.args.get('ProductName')
+        price = request.args.get('Price')
+        min_price = request.args.get('min_price')
+        max_price = request.args.get('max_price')
+        if pid is not None and pid != "":
+            try:
+                where.append("ProductID = %s")
+                params.append(int(pid))
+            except ValueError:
+                return render_response({'error': '`ProductID` must be integer'}, 400)
+        if name:
+            where.append("ProductName LIKE %s")
+            params.append(f"%{name.strip()}%")
+        if price is not None and price != "":
+            try:
+                pval = float(price)
+                where.append("Price = %s")
+                params.append(pval)
+            except ValueError:
+                return render_response({'error': '`Price` must be a number'}, 400)
+        if min_price is not None and min_price != "":
+            try:
+                where.append("Price >= %s")
+                params.append(float(min_price))
+            except ValueError:
+                return render_response({'error': '`min_price` must be a number'}, 400)
+        if max_price is not None and max_price != "":
+            try:
+                where.append("Price <= %s")
+                params.append(float(max_price))
+            except ValueError:
+                return render_response({'error': '`max_price` must be a number'}, 400)
+        base = "SELECT ProductID, ProductName, Price FROM products"
+        sql = base + (" WHERE " + " AND ".join(where) if where else "")
         cur = mysql.connection.cursor()
-        cur.execute("SELECT ProductID, ProductName, Price FROM products")
+        cur.execute(sql, tuple(params))
         rows = cur.fetchall()
         cur.close()
         products = [{'ProductID': r[0], 'ProductName': r[1], 'Price': float(r[2]) if r[2] is not None else None} for r in rows]
@@ -598,8 +691,53 @@ def delete_product(product_id):
 @app.route('/orders', methods=['GET'])
 def list_orders():
     try:
+        # Filters: OrderID, CustomerID, ProductID exact; Quantity exact/range
+        where = []
+        params = []
+        oid = request.args.get('OrderID')
+        cid = request.args.get('CustomerID')
+        pid = request.args.get('ProductID')
+        qty = request.args.get('Quantity')
+        min_qty = request.args.get('min_quantity')
+        max_qty = request.args.get('max_quantity')
+        def _int_param(val, name):
+            if val is None or val == "":
+                return None
+            try:
+                return int(val)
+            except ValueError:
+                raise ValueError(f'`{name}` must be integer')
+        try:
+            _oid = _int_param(oid, 'OrderID')
+            _cid = _int_param(cid, 'CustomerID')
+            _pid = _int_param(pid, 'ProductID')
+            _qty = _int_param(qty, 'Quantity')
+            _minq = _int_param(min_qty, 'min_quantity')
+            _maxq = _int_param(max_qty, 'max_quantity')
+        except ValueError as ve:
+            return render_response({'error': str(ve)}, 400)
+        if _oid is not None:
+            where.append('OrderID = %s')
+            params.append(_oid)
+        if _cid is not None:
+            where.append('CustomerID = %s')
+            params.append(_cid)
+        if _pid is not None:
+            where.append('ProductID = %s')
+            params.append(_pid)
+        if _qty is not None:
+            where.append('Quantity = %s')
+            params.append(_qty)
+        if _minq is not None:
+            where.append('Quantity >= %s')
+            params.append(_minq)
+        if _maxq is not None:
+            where.append('Quantity <= %s')
+            params.append(_maxq)
+        base = "SELECT OrderID, CustomerID, ProductID, Quantity FROM orders"
+        sql = base + (" WHERE " + " AND ".join(where) if where else "")
         cur = mysql.connection.cursor()
-        cur.execute("SELECT OrderID, CustomerID, ProductID, Quantity FROM orders")
+        cur.execute(sql, tuple(params))
         rows = cur.fetchall()
         cur.close()
         orders = [{'OrderID': r[0], 'CustomerID': r[1], 'ProductID': r[2], 'Quantity': r[3]} for r in rows]
