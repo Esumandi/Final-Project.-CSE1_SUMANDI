@@ -180,4 +180,10 @@ def client(monkeypatch):
     monkeypatch.setattr(__import__('app'), 'mysql', fake, raising=True)
     app.config['TESTING'] = True
     with app.test_client() as client:
+        # Authenticate to obtain JWT for secured endpoints
+        login_resp = client.post('/auth/login', json={'username': 'admin', 'password': 'admin'})
+        assert login_resp.status_code == 200, f"Login failed: {login_resp.data}"
+        token = login_resp.get_json()['access_token']
+        # Set default Authorization header for all subsequent requests
+        client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
         yield client

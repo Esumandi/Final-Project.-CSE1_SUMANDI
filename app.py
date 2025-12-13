@@ -1,9 +1,25 @@
 from flask import Flask, jsonify, request, url_for, make_response
 from flask_mysqldb import MySQL
 import re
+import os
+import datetime
+import jwt
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 app = Flask(__name__)
 
+# Security config
+APP_SECRET = os.getenv("APP_SECRET") or os.getenv("SECRET_KEY") or "dev-secret-change-me"
+JWT_ALGO = "HS256"
+JWT_EXP_MINUTES = int(os.getenv("JWT_EXP_MINUTES", "60"))
+# New: allow endpoints to soft-fail when DB is unavailable (for local JWT testing)
+DB_OPTIONAL = os.getenv("DB_OPTIONAL", "0") == "1"
+
+# MySQL configuration
 app.config['MYSQL_HOST'] = '127.0.0.1'
 app.config['MYSQL_USER'] = 'root'
 app.config['MYSQL_PASSWORD'] = 'Pentagon0211'
@@ -11,7 +27,59 @@ app.config['MYSQL_DB'] = 'CS_ELECT'
 
 mysql = MySQL(app)
 
-# Validation helpers
+# --- Auth helpers ---
+
+def _issue_token(subject, extra_claims=None, expires_minutes=JWT_EXP_MINUTES):
+    now = datetime.datetime.utcnow()
+    payload = {
+        "sub": str(subject),
+        "iat": now,
+        "exp": now + datetime.timedelta(minutes=expires_minutes),
+    }
+    if extra_claims:
+        payload.update(extra_claims)
+    return jwt.encode(payload, APP_SECRET, algorithm=JWT_ALGO)
+
+
+def _decode_token(token):
+    try:
+        return jwt.decode(token, APP_SECRET, algorithms=[JWT_ALGO])
+    except jwt.ExpiredSignatureError:
+        return {"_error": "Token expired"}
+    except jwt.InvalidTokenError:
+        return {"_error": "Invalid token"}
+
+
+def _get_bearer_token():
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth.split(" ", 1)[1].strip()
+    # Fallbacks to help local testing/debugging: allow token in query param or custom header
+    # (e.g. /endpoint?access_token=... or header X-Access-Token: <token>)
+    token = request.args.get('access_token') or request.args.get('token') or request.headers.get('X-Access-Token')
+    if token:
+        return token.strip()
+    return None
+
+
+def require_auth(fn):
+    from functools import wraps
+
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        token = _get_bearer_token()
+        if not token:
+            return render_response({"error": "Authorization header missing or invalid"}, 401, headers={"WWW-Authenticate": "Bearer"})
+        claims = _decode_token(token)
+        if "_error" in claims:
+            return render_response({"error": claims["_error"]}, 401, headers={"WWW-Authenticate": "Bearer error=invalid_token"})
+        # Attach claims to request context via global
+        request.claims = claims
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+# --- Validation helpers ---
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -137,6 +205,51 @@ def validate_user_payload(data, require_all=False):
     return True, None
 
 
+@app.route('/auth/login', methods=['POST'])
+def login():
+    # Simple demo login: accepts JSON {username, password}; in production, verify against DB/identity provider
+    data = request.get_json(silent=True) or {}
+    username = (data.get("username") or "").strip()
+    password = (data.get("password") or "").strip()
+    if not username or not password:
+        return render_response({"error": "username and password required"}, 400)
+
+    # Demo check: allow a single configured user
+    demo_user = os.getenv("DEMO_USER", "admin")
+    demo_pass = os.getenv("DEMO_PASS", "admin")
+    if username != demo_user or password != demo_pass:
+        return render_response({"error": "Invalid credentials"}, 401)
+
+    token = _issue_token(subject=username, extra_claims={"role": "admin"})
+    return render_response({"access_token": token, "token_type": "Bearer", "expires_in": JWT_EXP_MINUTES * 60}, 200)
+
+
+# New: token refresh endpoint to extend session without re-authenticating credentials
+@app.route('/auth/refresh', methods=['POST'])
+@require_auth
+def refresh():
+    claims = getattr(request, 'claims', {})
+    sub = claims.get('sub')
+    role = claims.get('role')
+    if not sub:
+        return render_response({"error": "Invalid token"}, 401)
+    new_token = _issue_token(subject=sub, extra_claims={"role": role} if role else None)
+    return render_response({"access_token": new_token, "token_type": "Bearer", "expires_in": JWT_EXP_MINUTES * 60}, 200)
+
+
+# Set secure headers on all responses
+@app.after_request
+def set_security_headers(resp):
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    resp.headers.setdefault('X-Frame-Options', 'DENY')
+    resp.headers.setdefault('X-XSS-Protection', '0')  # modern browsers use CSP; XSS filter deprecated
+    resp.headers.setdefault('Referrer-Policy', 'no-referrer')
+    resp.headers.setdefault('Cache-Control', 'no-store')
+    # Optional: basic CSP to reduce injection risk for HTML responses
+    resp.headers.setdefault('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+    return resp
+
+
 @app.route('/')
 def home():
     return 'Hello World!'
@@ -153,8 +266,24 @@ def testdb():
         app.logger.exception('Database connectivity test failed')
         return render_response({'error': 'Database error', 'detail': str(e)}, 500)
 
+@app.route('/health')
+def health():
+    # Basic health with optional DB ping
+    status = {"status": "ok"}
+    try:
+        cur = mysql.connection.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        status["db"] = "up"
+    except Exception as e:
+        status["db"] = "down"
+        status["detail"] = str(e)
+    return render_response(status, 200)
+
 # CRUD: Users
 @app.route('/users', methods=['GET'])
+@require_auth
 def list_users():
     try:
         # Build filters from query params
@@ -200,10 +329,14 @@ def list_users():
         return render_response(users, 200)
     except Exception as e:
         app.logger.exception('List users failed')
+        if DB_OPTIONAL:
+            # Soft-fail for local JWT testing: empty list
+            return render_response([], 200)
         return render_response({'error': 'Database error'}, 500)
 
 
 @app.route('/users/<int:user_id>', methods=['GET'])
+@require_auth
 def get_user(user_id):
     try:
         cur = mysql.connection.cursor()
@@ -220,6 +353,7 @@ def get_user(user_id):
 
 
 @app.route('/users', methods=['POST'])
+@require_auth
 def create_user():
     data = request.get_json(silent=True)
     ok, err = validate_user_payload(data or {}, require_all=True)
@@ -245,6 +379,7 @@ def create_user():
 
 
 @app.route('/users/<int:user_id>', methods=['PUT'])
+@require_auth
 def update_user(user_id):
     data = request.get_json(silent=True)
     ok, err = validate_user_payload(data or {}, require_all=True)
@@ -270,6 +405,7 @@ def update_user(user_id):
 
 
 @app.route('/users/<int:user_id>', methods=['PATCH'])
+@require_auth
 def patch_user(user_id):
     data = request.get_json(silent=True)
     if not data:
@@ -315,6 +451,7 @@ def patch_user(user_id):
 
 
 @app.route('/users/<int:user_id>', methods=['DELETE'])
+@require_auth
 def delete_user(user_id):
     try:
         cur = mysql.connection.cursor()
@@ -333,6 +470,7 @@ def delete_user(user_id):
 
 # CRUD: Customers
 @app.route('/customers', methods=['GET'])
+@require_auth
 def list_customers():
     try:
         # Filters: Name (LIKE), Phone (LIKE), CustomerID exact
@@ -363,6 +501,8 @@ def list_customers():
         return render_response(customers, 200)
     except Exception as e:
         app.logger.exception('List customers failed')
+        if DB_OPTIONAL:
+            return render_response([], 200)
         return render_response({'error': 'Database error'}, 500)
 
 
@@ -388,11 +528,13 @@ def validate_customer_payload(data, require_all=False):
 
 
 @app.route('/customers', methods=['POST'])
+@require_auth
 def create_customer():
     data = request.get_json(silent=True)
     ok, err = validate_customer_payload(data or {}, require_all=True)
     if not ok:
-        return render_response(jsonify({'error': err}).json, 400)
+        # Fixed: return consistent JSON dict, not jsonify.json
+        return render_response({'error': err}, 400)
     name = data['Name'].strip()
     phone = (data.get('Phone') or '').strip() or None
     try:
@@ -410,6 +552,7 @@ def create_customer():
 
 
 @app.route('/customers/<int:customer_id>', methods=['GET'])
+@require_auth
 def get_customer(customer_id):
     try:
         cur = mysql.connection.cursor()
@@ -425,6 +568,7 @@ def get_customer(customer_id):
 
 
 @app.route('/customers/<int:customer_id>', methods=['PUT'])
+@require_auth
 def update_customer(customer_id):
     data = request.get_json(silent=True)
     ok, err = validate_customer_payload(data or {}, require_all=True)
@@ -447,6 +591,7 @@ def update_customer(customer_id):
 
 
 @app.route('/customers/<int:customer_id>', methods=['PATCH'])
+@require_auth
 def patch_customer(customer_id):
     data = request.get_json(silent=True)
     if not data:
@@ -482,6 +627,7 @@ def patch_customer(customer_id):
 
 
 @app.route('/customers/<int:customer_id>', methods=['DELETE'])
+@require_auth
 def delete_customer(customer_id):
     try:
         cur = mysql.connection.cursor()
@@ -499,6 +645,7 @@ def delete_customer(customer_id):
 
 # CRUD: Products
 @app.route('/products', methods=['GET'])
+@require_auth
 def list_products():
     try:
         # Filters: ProductID exact, ProductName LIKE, Price exact/range
@@ -547,6 +694,8 @@ def list_products():
         return render_response(products, 200)
     except Exception as e:
         app.logger.exception('List products failed')
+        if DB_OPTIONAL:
+            return render_response([], 200)
         return render_response({'error': 'Database error'}, 500)
 
 
@@ -573,6 +722,7 @@ def validate_product_payload(data, require_all=False):
 
 
 @app.route('/products', methods=['POST'])
+@require_auth
 def create_product():
     data = request.get_json(silent=True)
     ok, err = validate_product_payload(data or {}, require_all=True)
@@ -595,6 +745,7 @@ def create_product():
 
 
 @app.route('/products/<int:product_id>', methods=['GET'])
+@require_auth
 def get_product(product_id):
     try:
         cur = mysql.connection.cursor()
@@ -610,6 +761,7 @@ def get_product(product_id):
 
 
 @app.route('/products/<int:product_id>', methods=['PUT'])
+@require_auth
 def update_product(product_id):
     data = request.get_json(silent=True)
     ok, err = validate_product_payload(data or {}, require_all=True)
@@ -632,6 +784,7 @@ def update_product(product_id):
 
 
 @app.route('/products/<int:product_id>', methods=['PATCH'])
+@require_auth
 def patch_product(product_id):
     data = request.get_json(silent=True)
     if not data:
@@ -672,6 +825,7 @@ def patch_product(product_id):
 
 
 @app.route('/products/<int:product_id>', methods=['DELETE'])
+@require_auth
 def delete_product(product_id):
     try:
         cur = mysql.connection.cursor()
@@ -689,6 +843,7 @@ def delete_product(product_id):
 
 # CRUD: Orders
 @app.route('/orders', methods=['GET'])
+@require_auth
 def list_orders():
     try:
         # Filters: OrderID, CustomerID, ProductID exact; Quantity exact/range
@@ -744,6 +899,8 @@ def list_orders():
         return render_response(orders, 200)
     except Exception as e:
         app.logger.exception('List orders failed')
+        if DB_OPTIONAL:
+            return render_response([], 200)
         return render_response({'error': 'Database error'}, 500)
 
 
@@ -778,6 +935,7 @@ def entity_exists(table, id_col, id_val):
 
 
 @app.route('/orders', methods=['POST'])
+@require_auth
 def create_order():
     data = request.get_json(silent=True)
     ok, err = validate_order_payload(data or {}, require_all=True)
@@ -806,6 +964,7 @@ def create_order():
 
 
 @app.route('/orders/<int:order_id>', methods=['GET'])
+@require_auth
 def get_order(order_id):
     try:
         cur = mysql.connection.cursor()
@@ -821,6 +980,7 @@ def get_order(order_id):
 
 
 @app.route('/orders/<int:order_id>', methods=['PUT'])
+@require_auth
 def update_order(order_id):
     data = request.get_json(silent=True)
     ok, err = validate_order_payload(data or {}, require_all=True)
@@ -848,6 +1008,7 @@ def update_order(order_id):
 
 
 @app.route('/orders/<int:order_id>', methods=['PATCH'])
+@require_auth
 def patch_order(order_id):
     data = request.get_json(silent=True)
     if not data:
@@ -898,6 +1059,7 @@ def patch_order(order_id):
 
 
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
+@require_auth
 def delete_order(order_id):
     try:
         cur = mysql.connection.cursor()
