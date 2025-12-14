@@ -1,6 +1,20 @@
-from flask import Flask, jsonify, request, url_for, make_response
+from flask import Flask, jsonify, request, url_for, make_response, g
 from flask_mysqldb import MySQL
 import re
+import os
+from datetime import timedelta
+
+# Add JWT imports but import lazily to avoid hard failure if not installed
+try:
+    from flask_jwt_extended import JWTManager, create_access_token, verify_jwt_in_request, get_jwt_identity, get_jwt
+    _HAS_JWT = True
+except Exception:
+    JWTManager = None
+    create_access_token = None
+    verify_jwt_in_request = None
+    get_jwt_identity = None
+    get_jwt = None
+    _HAS_JWT = False
 
 app = Flask(__name__)
 
@@ -9,7 +23,127 @@ app.config['MYSQL_USER'] = 'root'
 app.config['MYSQL_PASSWORD'] = 'Pentagon0211'
 app.config['MYSQL_DB'] = 'CS_ELECT'
 
+# JWT / Auth config (optional, controlled via env)
+# REQUIRE_AUTH: when true, endpoints (except whitelist) require Authorization: Bearer <token>
+app.config['REQUIRE_AUTH'] = os.environ.get('REQUIRE_AUTH', 'false').lower() in ('1', 'true', 'yes')
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'dev-secret')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=int(os.environ.get('JWT_EXP_HOURS', '1')))
+# Accept tokens from either Authorization header or query string (optional convenience)
+app.config['JWT_TOKEN_LOCATION'] = ['headers', 'query_string']
+app.config['JWT_QUERY_STRING_NAME'] = os.environ.get('JWT_QUERY_STRING_NAME', 'token')
+# Admin credentials used by /auth/login
+ADMIN_USER = os.environ.get('ADMIN_USER', 'admin')
+ADMIN_PASS = os.environ.get('ADMIN_PASS', 'admin')
+
 mysql = MySQL(app)
+
+# Initialize JWTManager only if library is available
+if _HAS_JWT:
+    jwt = JWTManager(app)
+
+from functools import wraps
+
+# Decorator for routes that require a valid JWT
+def auth_required(fn):
+    """
+    Decorator: Require a valid JWT when app.config['REQUIRE_AUTH'] is True.
+
+    Usage: @auth_required on Flask route functions that should be accessible
+    only to authenticated users. If authentication is disabled (REQUIRE_AUTH=False)
+    this decorator is a no-op. On success sets g.current_user to the token identity.
+    Returns HTTP 401 for missing/invalid token or 500 if JWT support is not installed.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # If auth is not enabled for the app, act as a no-op
+        if not app.config.get('REQUIRE_AUTH'):
+            return fn(*args, **kwargs)
+        if not _HAS_JWT:
+            return render_response({'error': 'JWT support not installed'}, 500)
+        try:
+            verify_jwt_in_request()
+            g.current_user = get_jwt_identity()
+        except Exception:
+            return render_response({'error': 'Missing or invalid token'}, 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+# Decorator for routes where JWT is optional but identity should be attached when present
+def auth_optional(fn):
+    """
+    Decorator: Make JWT optional for a route but attach identity when present.
+
+    Usage: @auth_optional on routes where authentication should not block access
+    but you still want g.current_user populated when a valid token is provided.
+    If REQUIRE_AUTH is False this decorator sets g.current_user = None and is a no-op.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        # If auth is not enabled for the app, ensure g.current_user is None and continue
+        if not app.config.get('REQUIRE_AUTH'):
+            g.current_user = None
+            return fn(*args, **kwargs)
+        # _attach_jwt_identity_optional already ran, but defensively ensure g.current_user is set
+        if not hasattr(g, 'current_user'):
+            g.current_user = None
+        return fn(*args, **kwargs)
+    return wrapper
+
+# Decorator for admin-only routes. If REQUIRE_AUTH is false, this is a no-op to preserve backward compatibility for tests.
+def admin_required(fn):
+    """
+    Decorator: Require admin privileges for the wrapped route.
+
+    Usage: @admin_required to restrict access to admin users. When REQUIRE_AUTH
+    is False the decorator is a no-op (keeps backward compatibility for tests).
+    It accepts an admin either by matching ADMIN_USER or a JWT claim `is_admin`=True.
+    On success sets g.current_user to the admin identity.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not app.config.get('REQUIRE_AUTH'):
+            return fn(*args, **kwargs)
+        if not _HAS_JWT:
+            return render_response({'error': 'JWT support not installed'}, 500)
+        try:
+            verify_jwt_in_request()
+            identity = get_jwt_identity()
+            # Allow ADMIN_USER or a token claim `is_admin`=True
+            is_admin_claim = False
+            try:
+                claims = get_jwt() if get_jwt is not None else {}
+                is_admin_claim = bool(claims.get('is_admin', False))
+            except Exception:
+                is_admin_claim = False
+            if identity != ADMIN_USER and not is_admin_claim:
+                return render_response({'error': 'Admin privileges required'}, 403)
+            g.current_user = identity
+        except Exception:
+            return render_response({'error': 'Missing or invalid token'}, 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
+# Forceful auth decorator: always require a valid JWT (ignores REQUIRE_AUTH). Use when endpoint must be protected immediately.
+def force_auth_required(fn):
+    """
+    Decorator: Force JWT authentication for the wrapped route regardless of REQUIRE_AUTH.
+
+    Usage: @force_auth_required for endpoints that must always be protected even
+    if the global REQUIRE_AUTH flag is disabled. On success sets g.current_user.
+    Returns 401 on missing/invalid token, or 500 if JWT support is not installed.
+    """
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not _HAS_JWT:
+            return render_response({'error': 'JWT support not installed'}, 500)
+        try:
+            verify_jwt_in_request()
+            g.current_user = get_jwt_identity()
+        except Exception:
+            return render_response({'error': 'Missing or invalid token'}, 401)
+        return fn(*args, **kwargs)
+    return wrapper
+
 
 # Validation helpers
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -18,6 +152,11 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # --- Response formatting helper ---
 
 def _to_xml_tag(key):
+    """
+    Helper: sanitize a dictionary key into a safe XML tag name.
+
+    Usage: internal helper used by XML rendering functions to produce valid tags.
+    """
     # Ensure valid XML tag by removing spaces and non-alnum (basic safety)
     safe = re.sub(r"[^a-zA-Z0-9_]", "", str(key)) or "item"
     # Tags cannot start with a digit
@@ -27,6 +166,11 @@ def _to_xml_tag(key):
 
 
 def _escape_xml(text):
+    """
+    Helper: escape special characters for XML output.
+
+    Usage: internal helper for XML serialization to avoid breaking XML structure.
+    """
     if text is None:
         return ""
     s = str(text)
@@ -40,6 +184,12 @@ def _escape_xml(text):
 
 
 def _dict_to_xml(d, root_name="object"):
+    """
+    Helper: convert a dict into a simple XML string.
+
+    Usage: called by render_response when format=xml and the payload is a dict.
+    Handles nested dicts and lists of simple items or dicts.
+    """
     parts = [f"<{root_name}>"]
     for k, v in d.items():
         tag = _to_xml_tag(k)
@@ -60,6 +210,12 @@ def _dict_to_xml(d, root_name="object"):
 
 
 def _list_to_xml(lst, root_name="items", item_name="item"):
+    """
+    Helper: convert a list into a simple XML string.
+
+    Usage: called by render_response when format=xml and the payload is a list.
+    Each list element becomes an XML element with name `item_name`.
+    """
     parts = [f"<{root_name}>"]
     for item in lst:
         if isinstance(item, dict):
@@ -71,9 +227,12 @@ def _list_to_xml(lst, root_name="items", item_name="item"):
 
 
 def render_response(payload, status=200, headers=None):
-    """Render payload as JSON (default) or XML based on `format` query arg.
-    - Accepts dict or list payload. For non-JSON payload (string/None), returns as-is.
-    - Sets appropriate Content-Type header.
+    """
+    Response helper: render payload as JSON (default) or XML when ?format=xml.
+
+    Usage: Use this helper everywhere to keep consistent response formats,
+    content types, and status codes. Accepts dict/list (JSON) or returns XML
+    string for xml format. Also supports plain text or empty-body responses.
     """
     fmt = (request.args.get("format") or "json").lower()
     headers = headers or {}
@@ -107,42 +266,24 @@ def render_response(payload, status=200, headers=None):
     return resp
 
 
-def validate_user_payload(data, require_all=False):
-    if not isinstance(data, dict):
-        return False, "Invalid JSON payload"
-    name = data.get('name')
-    email = data.get('email')
-    age = data.get('age', None)
-
-    if require_all:
-        if name is None or email is None:
-            return False, "`name` and `email` are required"
-
-    if name is not None:
-        if not isinstance(name, str) or not name.strip():
-            return False, "`name` must be a non-empty string"
-        if len(name) > 100:
-            return False, "`name` too long (max 100)"
-
-    if email is not None:
-        if not isinstance(email, str) or not EMAIL_RE.match(email):
-            return False, "`email` is invalid"
-        if len(email) > 100:
-            return False, "`email` too long (max 100)"
-
-    if age is not None:
-        if not (isinstance(age, int) and 0 <= age <= 150):
-            return False, "`age` must be integer between 0 and 150"
-
-    return True, None
-
 
 @app.route('/')
 def home():
+    """
+    Route: Root endpoint.
+
+    Usage: GET / returns a simple health string. Useful for smoke tests.
+    """
     return 'Hello World!'
 
 @app.route("/testdb")
 def testdb():
+    """
+    Route: Test database connectivity.
+
+    Usage: GET /testdb attempts a simple SELECT DATABASE() query and returns
+    the connected database name or a 500 error when a DB error occurs.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT DATABASE()")
@@ -153,158 +294,49 @@ def testdb():
         app.logger.exception('Database connectivity test failed')
         return render_response({'error': 'Database error', 'detail': str(e)}, 500)
 
-# CRUD: Users
-@app.route('/users', methods=['GET'])
-def list_users():
-    try:
-        cur = mysql.connection.cursor()
-        cur.execute("SELECT id, name, email, age FROM users")
-        rows = cur.fetchall()
-        cur.close()
-        users = [{'id': r[0], 'name': r[1], 'email': r[2], 'age': r[3]} for r in rows]
-        return render_response(users, 200)
-    except Exception as e:
-        app.logger.exception('List users failed')
-        return render_response({'error': 'Database error'}, 500)
-
-
-@app.route('/users/<int:user_id>', methods=['GET'])
-def get_user(user_id):
-    try:
-        cur = mysql.connection.cursor()
-        cur.execute("SELECT id, name, email, age FROM users WHERE id = %s", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return render_response({'error': 'User not found'}, 404)
-        user = {'id': row[0], 'name': row[1], 'email': row[2], 'age': row[3]}
-        return render_response(user, 200)
-    except Exception as e:
-        app.logger.exception('Get user failed')
-        return render_response({'error': 'Database error'}, 500)
-
-
-@app.route('/users', methods=['POST'])
-def create_user():
-    data = request.get_json(silent=True)
-    ok, err = validate_user_payload(data or {}, require_all=True)
-    if not ok:
-        return render_response({'error': err}, 400)
-
-    name = data['name'].strip()
-    email = data['email'].strip()
-    age = data.get('age')
-
-    try:
-        cur = mysql.connection.cursor()
-        cur.execute("INSERT INTO users (name, email, age) VALUES (%s, %s, %s)", (name, email, age))
-        mysql.connection.commit()
-        new_id = cur.lastrowid
-        cur.close()
-        location = url_for('get_user', user_id=new_id, _external=True)
-        headers = {'Location': location}
-        return render_response({'id': new_id, 'name': name, 'email': email, 'age': age}, 201, headers=headers)
-    except Exception as e:
-        app.logger.exception('Create user failed')
-        return render_response({'error': 'Database error'}, 500)
-
-
-@app.route('/users/<int:user_id>', methods=['PUT'])
-def update_user(user_id):
-    data = request.get_json(silent=True)
-    ok, err = validate_user_payload(data or {}, require_all=True)
-    if not ok:
-        return render_response({'error': err}, 400)
-
-    name = data['name'].strip()
-    email = data['email'].strip()
-    age = data.get('age')
-
-    try:
-        cur = mysql.connection.cursor()
-        cur.execute("UPDATE users SET name=%s, email=%s, age=%s WHERE id=%s", (name, email, age, user_id))
-        mysql.connection.commit()
-        affected = cur.rowcount
-        cur.close()
-        if affected == 0:
-            return render_response({'error': 'User not found'}, 404)
-        return render_response({'id': user_id, 'name': name, 'email': email, 'age': age}, 200)
-    except Exception as e:
-        app.logger.exception('Update user failed')
-        return render_response({'error': 'Database error'}, 500)
-
-
-@app.route('/users/<int:user_id>', methods=['PATCH'])
-def patch_user(user_id):
-    data = request.get_json(silent=True)
-    if not data:
-        return render_response({'error': 'Empty payload'}, 400)
-
-    ok, err = validate_user_payload(data, require_all=False)
-    if not ok:
-        return render_response({'error': err}, 400)
-
-    fields = []
-    values = []
-    for key in ('name', 'email', 'age'):
-        if key in data:
-            val = data[key]
-            if key == 'name' and isinstance(val, str):
-                val = val.strip()
-            values.append(val)
-            fields.append(f"{key} = %s")
-
-    if not fields:
-        return render_response({'error': 'No updatable fields provided'}, 400)
-
-    sql = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
-    values.append(user_id)
-
-    try:
-        cur = mysql.connection.cursor()
-        cur.execute(sql, tuple(values))
-        mysql.connection.commit()
-        affected = cur.rowcount
-        cur.close()
-        if affected == 0:
-            return render_response({'error': 'User not found'}, 404)
-        cur = mysql.connection.cursor()
-        cur.execute("SELECT id, name, email, age FROM users WHERE id = %s", (user_id,))
-        row = cur.fetchone()
-        cur.close()
-        user = {'id': row[0], 'name': row[1], 'email': row[2], 'age': row[3]} if row else {'id': user_id}
-        return render_response(user, 200)
-    except Exception as e:
-        app.logger.exception('Patch user failed')
-        return render_response({'error': 'Database error'}, 500)
-
-
-@app.route('/users/<int:user_id>', methods=['DELETE'])
-def delete_user(user_id):
-    try:
-        cur = mysql.connection.cursor()
-        cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
-        mysql.connection.commit()
-        affected = cur.rowcount
-        cur.close()
-        if affected == 0:
-            return render_response({'error': 'User not found'}, 404)
-        # No content
-        return render_response('', 204)
-    except Exception as e:
-        app.logger.exception('Delete user failed')
-        return render_response({'error': 'Database error'}, 500)
-
-
 # CRUD: Customers
 @app.route('/customers', methods=['GET'])
+@force_auth_required
 def list_customers():
+    """
+    Route: List all customers (protected).
+
+    Usage: GET /customers returns customers and requires a valid JWT due to
+    @force_auth_required. Returns 500 on DB errors. Supports optional query
+    parameters for searching: `q`, `name`, `phone` (case-insensitive substring
+    matches). When no params are supplied behavior is unchanged.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT CustomerID, Name, Phone FROM customers")
         rows = cur.fetchall()
         cur.close()
         customers = [{'CustomerID': r[0], 'Name': r[1], 'Phone': r[2]} for r in rows]
+
+        # --- Search / filter support ---
+        # Supported query params: q, name, phone (case-insensitive substring)
+        q = request.args.get('q')
+        name = request.args.get('name')
+        phone = request.args.get('phone')
+
+        # Basic validation
+        for sval, pname in ((q, 'q'), (name, 'name'), (phone, 'phone')):
+            if sval is not None and len(sval) > 200:
+                return render_response({'error': f'parameter `{pname}` too long'}, 400)
+
+        def _ci(s):
+            return (s or '').lower()
+
+        if q:
+            ql = q.strip().lower()
+            customers = [c for c in customers if ql in _ci(c.get('Name'))]
+        if name:
+            nl = name.strip().lower()
+            customers = [c for c in customers if nl in _ci(c.get('Name'))]
+        if phone:
+            pl = phone.strip().lower()
+            customers = [c for c in customers if pl in _ci(c.get('Phone'))]
+
         return render_response(customers, 200)
     except Exception as e:
         app.logger.exception('List customers failed')
@@ -312,6 +344,12 @@ def list_customers():
 
 
 def validate_customer_payload(data, require_all=False):
+    """
+    Validate customer payload for customer endpoints.
+
+    Usage: Ensures `Name` and optional `Phone` meet requirements. Returns
+    (True, None) or (False, error_message).
+    """
     if not isinstance(data, dict):
         return False, 'Invalid JSON payload'
     name = data.get('Name')
@@ -333,7 +371,14 @@ def validate_customer_payload(data, require_all=False):
 
 
 @app.route('/customers', methods=['POST'])
+@admin_required
 def create_customer():
+    """
+    Route: Create a new customer (admin only).
+
+    Usage: POST /customers with JSON {Name, Phone?}. Requires admin privileges
+    via @admin_required. Returns 201 with Location header on success.
+    """
     data = request.get_json(silent=True)
     ok, err = validate_customer_payload(data or {}, require_all=True)
     if not ok:
@@ -355,7 +400,13 @@ def create_customer():
 
 
 @app.route('/customers/<int:customer_id>', methods=['GET'])
+@force_auth_required
 def get_customer(customer_id):
+    """
+    Route: Get a customer by ID (protected).
+
+    Usage: GET /customers/<id> returns customer record or 404. Requires JWT.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT CustomerID, Name, Phone FROM customers WHERE CustomerID=%s", (customer_id,))
@@ -370,7 +421,14 @@ def get_customer(customer_id):
 
 
 @app.route('/customers/<int:customer_id>', methods=['PUT'])
+@admin_required
 def update_customer(customer_id):
+    """
+    Route: Replace a customer (admin only).
+
+    Usage: PUT /customers/<id> with full payload {Name, Phone?}. Validates input
+    and returns 200 or 404 if not found.
+    """
     data = request.get_json(silent=True)
     ok, err = validate_customer_payload(data or {}, require_all=True)
     if not ok:
@@ -392,7 +450,14 @@ def update_customer(customer_id):
 
 
 @app.route('/customers/<int:customer_id>', methods=['PATCH'])
+@admin_required
 def patch_customer(customer_id):
+    """
+    Route: Partially update a customer (admin only).
+
+    Usage: PATCH /customers/<id> with any subset of {Name, Phone}. Returns 200
+    with CustomerID or 404 when not found. Validates fields provided.
+    """
     data = request.get_json(silent=True)
     if not data:
         return render_response({'error': 'Empty payload'}, 400)
@@ -427,7 +492,14 @@ def patch_customer(customer_id):
 
 
 @app.route('/customers/<int:customer_id>', methods=['DELETE'])
+@admin_required
 def delete_customer(customer_id):
+    """
+    Route: Delete a customer (admin only).
+
+    Usage: DELETE /customers/<id> removes the customer and returns 204 on success
+    or 404 if not found.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("DELETE FROM customers WHERE CustomerID=%s", (customer_id,))
@@ -440,17 +512,65 @@ def delete_customer(customer_id):
     except Exception as e:
         app.logger.exception('Delete customer failed')
         return render_response({'error': 'Database error'}, 500)
-
+#end
 
 # CRUD: Products
 @app.route('/products', methods=['GET'])
 def list_products():
+    """
+    Route: List all products.
+
+    Usage: GET /products returns JSON list of products with ProductID, ProductName, Price.
+    Supports query params: `q` or `name` (substring on ProductName), `min_price`, `max_price`.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT ProductID, ProductName, Price FROM products")
         rows = cur.fetchall()
         cur.close()
         products = [{'ProductID': r[0], 'ProductName': r[1], 'Price': float(r[2]) if r[2] is not None else None} for r in rows]
+
+        # --- Search / filter support ---
+        q = request.args.get('q')
+        name = request.args.get('name')
+        min_price = request.args.get('min_price')
+        max_price = request.args.get('max_price')
+
+        # Validate string lengths
+        for sval, pname in ((q, 'q'), (name, 'name')):
+            if sval is not None and len(sval) > 200:
+                return render_response({'error': f'parameter `{pname}` too long'}, 400)
+
+        # Parse numeric filters
+        min_p = None
+        max_p = None
+        if min_price is not None and min_price != '':
+            try:
+                min_p = float(min_price)
+            except Exception:
+                return render_response({'error': '`min_price` must be a number'}, 400)
+        if max_price is not None and max_price != '':
+            try:
+                max_p = float(max_price)
+            except Exception:
+                return render_response({'error': '`max_price` must be a number'}, 400)
+        if min_p is not None and max_p is not None and min_p > max_p:
+            return render_response({'error': '`min_price` must be <= `max_price`'}, 400)
+
+        def _ci(s):
+            return (s or '').lower()
+
+        if q:
+            ql = q.strip().lower()
+            products = [p for p in products if ql in _ci(p.get('ProductName'))]
+        if name:
+            nl = name.strip().lower()
+            products = [p for p in products if nl in _ci(p.get('ProductName'))]
+        if min_p is not None:
+            products = [p for p in products if (p.get('Price') is not None and p.get('Price') >= min_p)]
+        if max_p is not None:
+            products = [p for p in products if (p.get('Price') is not None and p.get('Price') <= max_p)]
+
         return render_response(products, 200)
     except Exception as e:
         app.logger.exception('List products failed')
@@ -458,6 +578,12 @@ def list_products():
 
 
 def validate_product_payload(data, require_all=False):
+    """
+    Validate product payload for product endpoints.
+
+    Usage: Ensures `ProductName` and `Price` meet type and boundary checks. Returns
+    (True, None) or (False, error_message).
+    """
     if not isinstance(data, dict):
         return False, 'Invalid JSON payload'
     name = data.get('ProductName')
@@ -480,7 +606,14 @@ def validate_product_payload(data, require_all=False):
 
 
 @app.route('/products', methods=['POST'])
+@admin_required
 def create_product():
+    """
+    Route: Create a new product (admin only).
+
+    Usage: POST /products with JSON {ProductName, Price}. Returns 201 and Location
+    header on success.
+    """
     data = request.get_json(silent=True)
     ok, err = validate_product_payload(data or {}, require_all=True)
     if not ok:
@@ -503,6 +636,11 @@ def create_product():
 
 @app.route('/products/<int:product_id>', methods=['GET'])
 def get_product(product_id):
+    """
+    Route: Get a product by ID.
+
+    Usage: GET /products/<id> returns product or 404 if not found.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT ProductID, ProductName, Price FROM products WHERE ProductID=%s", (product_id,))
@@ -517,7 +655,14 @@ def get_product(product_id):
 
 
 @app.route('/products/<int:product_id>', methods=['PUT'])
+@admin_required
 def update_product(product_id):
+    """
+    Route: Replace a product (admin only).
+
+    Usage: PUT /products/<id> with full payload {ProductName, Price}. Validates data
+    and returns updated product or 404 if not found.
+    """
     data = request.get_json(silent=True)
     ok, err = validate_product_payload(data or {}, require_all=True)
     if not ok:
@@ -539,7 +684,14 @@ def update_product(product_id):
 
 
 @app.route('/products/<int:product_id>', methods=['PATCH'])
+@admin_required
 def patch_product(product_id):
+    """
+    Route: Partially update a product (admin only).
+
+    Usage: PATCH /products/<id> with any subset of {ProductName, Price}. Returns 200
+    with ProductID or 404 if not found. Validates fields provided.
+    """
     data = request.get_json(silent=True)
     if not data:
         return render_response({'error': 'Empty payload'}, 400)
@@ -579,7 +731,14 @@ def patch_product(product_id):
 
 
 @app.route('/products/<int:product_id>', methods=['DELETE'])
+@admin_required
 def delete_product(product_id):
+    """
+    Route: Delete a product (admin only).
+
+    Usage: DELETE /products/<id> removes the product and returns 204 on success
+    or 404 if not found.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("DELETE FROM products WHERE ProductID=%s", (product_id,))
@@ -597,12 +756,100 @@ def delete_product(product_id):
 # CRUD: Orders
 @app.route('/orders', methods=['GET'])
 def list_orders():
+    """
+    Route: List all orders.
+
+    Usage: GET /orders returns JSON list of orders with OrderID, CustomerID, ProductID, Quantity.
+    Supports query params: order_id, customer_id, product_id, min_qty, max_qty, customer_name.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT OrderID, CustomerID, ProductID, Quantity FROM orders")
         rows = cur.fetchall()
         cur.close()
         orders = [{'OrderID': r[0], 'CustomerID': r[1], 'ProductID': r[2], 'Quantity': r[3]} for r in rows]
+
+        # --- Search / filter support ---
+        order_id = request.args.get('order_id')
+        customer_id = request.args.get('customer_id')
+        product_id = request.args.get('product_id')
+        min_qty = request.args.get('min_qty')
+        max_qty = request.args.get('max_qty')
+        customer_name = request.args.get('customer_name')
+
+        # Validate lengths for strings
+        if customer_name is not None and len(customer_name) > 200:
+            return render_response({'error': 'parameter `customer_name` too long'}, 400)
+
+        # Parse integer filters
+        try:
+            if order_id is not None and order_id != '':
+                order_id_i = int(order_id)
+            else:
+                order_id_i = None
+        except ValueError:
+            return render_response({'error': '`order_id` must be an integer'}, 400)
+        try:
+            if customer_id is not None and customer_id != '':
+                customer_id_i = int(customer_id)
+            else:
+                customer_id_i = None
+        except ValueError:
+            return render_response({'error': '`customer_id` must be an integer'}, 400)
+        try:
+            if product_id is not None and product_id != '':
+                product_id_i = int(product_id)
+            else:
+                product_id_i = None
+        except ValueError:
+            return render_response({'error': '`product_id` must be an integer'}, 400)
+        try:
+            if min_qty is not None and min_qty != '':
+                min_qty_i = int(min_qty)
+            else:
+                min_qty_i = None
+        except ValueError:
+            return render_response({'error': '`min_qty` must be an integer'}, 400)
+        try:
+            if max_qty is not None and max_qty != '':
+                max_qty_i = int(max_qty)
+            else:
+                max_qty_i = None
+        except ValueError:
+            return render_response({'error': '`max_qty` must be an integer'}, 400)
+
+        # Build customer id->name map if needed for customer_name search
+        cust_map = {}
+        try:
+            cur = mysql.connection.cursor()
+            # Use same SELECT form as other parts of app so tests' FakeCursor supports it
+            cur.execute("SELECT CustomerID, Name, Phone FROM customers")
+            crow_rows = cur.fetchall()
+            cur.close()
+            for cr in crow_rows:
+                cust_map[cr[0]] = cr[1]
+        except Exception:
+            # If customers can't be fetched, ignore name-based filtering
+            cust_map = {}
+
+        def _ci(s):
+            return (s or '').lower()
+
+        # Apply filters (AND semantics)
+        if order_id_i is not None:
+            orders = [o for o in orders if o.get('OrderID') == order_id_i]
+        if customer_id_i is not None:
+            orders = [o for o in orders if o.get('CustomerID') == customer_id_i]
+        if product_id_i is not None:
+            orders = [o for o in orders if o.get('ProductID') == product_id_i]
+        if min_qty_i is not None:
+            orders = [o for o in orders if isinstance(o.get('Quantity'), int) and o.get('Quantity') >= min_qty_i]
+        if max_qty_i is not None:
+            orders = [o for o in orders if isinstance(o.get('Quantity'), int) and o.get('Quantity') <= max_qty_i]
+        if customer_name:
+            cnl = customer_name.strip().lower()
+            orders = [o for o in orders if cnl in _ci(cust_map.get(o.get('CustomerID')))]
+
         return render_response(orders, 200)
     except Exception as e:
         app.logger.exception('List orders failed')
@@ -610,6 +857,12 @@ def list_orders():
 
 
 def validate_order_payload(data, require_all=False):
+    """
+    Validate order payload for order endpoints.
+
+    Usage: Ensures CustomerID, ProductID, and Quantity are integers and Quantity > 0.
+    Returns (True, None) or (False, error_message).
+    """
     if not isinstance(data, dict):
         return False, 'Invalid JSON payload'
     customer_id = data.get('CustomerID')
@@ -629,6 +882,12 @@ def validate_order_payload(data, require_all=False):
 
 
 def entity_exists(table, id_col, id_val):
+    """
+    Helper: Check whether an entity exists in the DB.
+
+    Usage: entity_exists('customers', 'CustomerID', id) returns True if the row exists.
+    Used for foreign key validation in order-related endpoints.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute(f"SELECT 1 FROM {table} WHERE {id_col}=%s", (id_val,))
@@ -641,6 +900,12 @@ def entity_exists(table, id_col, id_val):
 
 @app.route('/orders', methods=['POST'])
 def create_order():
+    """
+    Route: Create a new order.
+
+    Usage: POST /orders with JSON {CustomerID, ProductID, Quantity}. Validates
+    payload and that the referenced customer and product exist. Returns 201.
+    """
     data = request.get_json(silent=True)
     ok, err = validate_order_payload(data or {}, require_all=True)
     if not ok:
@@ -669,6 +934,11 @@ def create_order():
 
 @app.route('/orders/<int:order_id>', methods=['GET'])
 def get_order(order_id):
+    """
+    Route: Get an order by ID.
+
+    Usage: GET /orders/<id> returns order or 404 if not found.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("SELECT OrderID, CustomerID, ProductID, Quantity FROM orders WHERE OrderID=%s", (order_id,))
@@ -684,6 +954,12 @@ def get_order(order_id):
 
 @app.route('/orders/<int:order_id>', methods=['PUT'])
 def update_order(order_id):
+    """
+    Route: Replace an order.
+
+    Usage: PUT /orders/<id> with full payload {CustomerID, ProductID, Quantity}. Validates
+    foreign keys and returns updated order or 404 if not found.
+    """
     data = request.get_json(silent=True)
     ok, err = validate_order_payload(data or {}, require_all=True)
     if not ok:
@@ -711,6 +987,12 @@ def update_order(order_id):
 
 @app.route('/orders/<int:order_id>', methods=['PATCH'])
 def patch_order(order_id):
+    """
+    Route: Partially update an order.
+
+    Usage: PATCH /orders/<id> with subset of {CustomerID, ProductID, Quantity}. Validates
+    provided fields and foreign keys as needed. Returns 200 with OrderID or 404.
+    """
     data = request.get_json(silent=True)
     if not data:
         return render_response({'error': 'Empty payload'}, 400)
@@ -761,6 +1043,11 @@ def patch_order(order_id):
 
 @app.route('/orders/<int:order_id>', methods=['DELETE'])
 def delete_order(order_id):
+    """
+    Route: Delete an order.
+
+    Usage: DELETE /orders/<id> removes the order and returns 204 on success or 404 if not found.
+    """
     try:
         cur = mysql.connection.cursor()
         cur.execute("DELETE FROM orders WHERE OrderID=%s", (order_id,))
@@ -775,6 +1062,90 @@ def delete_order(order_id):
         return render_response({'error': 'Database error'}, 500)
 
 
+# --- Authentication endpoints and enforcement ---
+
+# Whitelist paths that are always allowed even when REQUIRE_AUTH is True
+_AUTH_WHITELIST = set([
+    '/',
+    '/testdb',
+    '/auth/login'
+])
+
+@app.before_request
+def _require_auth_if_enabled():
+    """
+    Request hook: Enforce JWT auth when REQUIRE_AUTH is True.
+
+    Usage: Runs before each request. Returns 500 if JWT library missing when
+    REQUIRE_AUTH is enabled. Allows whitelist paths to bypass auth. Otherwise
+    verifies the JWT and returns 401 on failure.
+    """
+    # If auth not required, skip
+    if not app.config.get('REQUIRE_AUTH'):
+        return None
+    # If JWT library not installed, return 500 with helpful message
+    if not _HAS_JWT:
+        return render_response({'error': 'JWT support not installed. Set REQUIRE_AUTH=false or install Flask-JWT-Extended.'}, 500)
+    # Allow whitelist
+    path = request.path
+    if path in _AUTH_WHITELIST:
+        return None
+    # Verify JWT in request (will abort with 401 if invalid/missing)
+    try:
+        verify_jwt_in_request()
+    except Exception as e:
+        # Using render_response to keep consistent response format
+        return render_response({'error': 'Missing or invalid token'}, 401)
+
+
+@app.before_request
+def _attach_jwt_identity_optional():
+    """
+    Request hook: Attach JWT identity to g.current_user when present.
+
+    Usage: Runs before each request and sets g.current_user to the token identity
+    if a valid token is provided (optional=True). If JWT support is absent or
+    token invalid/missing, g.current_user will be None.
+    """
+    # Only attempt if JWT support is installed
+    if not _HAS_JWT:
+        g.current_user = None
+        return None
+    try:
+        # optional=True will not abort if token missing/invalid; it only verifies if present
+        verify_jwt_in_request(optional=True)
+        # If a token was present and valid, set current_user; otherwise None
+        g.current_user = get_jwt_identity()
+    except Exception:
+        # Any error means we don't have a usable identity for this request
+        g.current_user = None
+    return None
+
+
+@app.route('/auth/login', methods=['POST'])
+def auth_login():
+    """
+    Route: Simple admin login to obtain a JWT access token.
+
+    Usage: POST /auth/login with JSON {username, password}. Validates against
+    ADMIN_USER/ADMIN_PASS env vars and returns access_token on success.
+    Returns 400 for missing creds, 401 for invalid, and 500 if JWT is not installed.
+    """
+    if not _HAS_JWT:
+        return render_response({'error': 'JWT support not installed'}, 500)
+    data = request.get_json(silent=True) or {}
+    username = data.get('username')
+    password = data.get('password')
+    if not username or not password:
+        return render_response({'error': 'username and password required'}, 400)
+    if username != ADMIN_USER or password != ADMIN_PASS:
+        return render_response({'error': 'Invalid credentials'}, 401)
+    # Create access token
+    token = create_access_token(identity=username)
+    return render_response({'access_token': token}, 200)
+
+
 if __name__ == '__main__':
-    # Bind to localhost on a non-conflicting port to avoid AirPlay/AirTunes intercepting 5000
+
     app.run(debug=True, host='127.0.0.1', port=5001)
+
