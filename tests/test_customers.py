@@ -1,3 +1,7 @@
+import os
+
+
+
 def test_customers_crud(client):
     # List initially empty
     rv = client.get('/customers')

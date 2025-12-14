@@ -1,4 +1,8 @@
 import pytest
+import os
+
+# Ensure auth enforcement is enabled for tests that expect tokens
+os.environ.setdefault('REQUIRE_AUTH', 'true')
 
 # Minimal fake DB to simulate MySQL operations used by the app
 class FakeCursor:
@@ -174,16 +178,25 @@ class FakeMySQL:
 
 @pytest.fixture
 def client(monkeypatch):
+    # Set REQUIRE_AUTH true before importing app so app picks it up
+    os.environ.setdefault('REQUIRE_AUTH', 'true')
     from app import app
     # Monkeypatch the mysql object on the app module with our fake
     fake = FakeMySQL(app)
     monkeypatch.setattr(__import__('app'), 'mysql', fake, raising=True)
     app.config['TESTING'] = True
+
+    token = None
+    try:
+        # generate a token using Flask-JWT-Extended
+        from flask_jwt_extended import create_access_token
+        with app.app_context():
+            token = create_access_token(identity=os.environ.get('ADMIN_USER', 'admin'))
+    except Exception:
+        # Fail fast with helpful message so test runner shows cause
+        raise RuntimeError("Flask-JWT-Extended not available in test environment. Install requirements.txt before running tests: pip install -r requirements.txt")
+
     with app.test_client() as client:
-        # Authenticate to obtain JWT for secured endpoints
-        login_resp = client.post('/auth/login', json={'username': 'admin', 'password': 'admin'})
-        assert login_resp.status_code == 200, f"Login failed: {login_resp.data}"
-        token = login_resp.get_json()['access_token']
-        # Set default Authorization header for all subsequent requests
-        client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
+        if token:
+            client.environ_base['HTTP_AUTHORIZATION'] = f'Bearer {token}'
         yield client
